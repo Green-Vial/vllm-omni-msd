@@ -46,6 +46,7 @@ optimization.
 
 from __future__ import annotations
 
+from copy import copy
 from typing import Any
 
 import numpy as np
@@ -238,6 +239,61 @@ def shrink_refused_multi_step_window(scheduler_output: SchedulerOutput) -> None:
         scheduler_output.total_num_scheduled_tokens -= reclaimed
 
 
+def _build_window_meta_copies(
+    base_meta: dict[str, Any],
+    runner: Any,
+    num_reqs: int,
+    window_k: int,
+) -> list[dict[str, Any]] | None:
+    """Derive per-step attention metadata for steps 1..K-1 from the step-0
+    build.
+
+    A pure decode window only varies per step in the sequence lengths:
+    the block tables and slot mappings are live views of the runner's
+    buffers (per-step ``compute_slot_mapping`` refreshes them in place),
+    the query layout is frozen for the window, and the FIA attention
+    backend consumes ``seq_lens`` / ``seq_lens_list`` per layer.  So each
+    later step is a shallow copy of the step-0 metadata with only the
+    seq-len fields refreshed to ``base_lens + j``.
+
+    Returns ``None`` on any failure -- the caller then keeps building
+    metadata per step, so this is a pure optimization (never a
+    correctness dependency).
+    """
+    try:
+        if not isinstance(base_meta, dict) or not base_meta:
+            return None
+        base_lens = [
+            int(runner.optimistic_seq_lens_cpu[i]) for i in range(num_reqs)
+        ]
+        steps: list[dict[str, Any]] = []
+        for j in range(1, window_k):
+            meta_j: dict[str, Any] = {}
+            for key, md in base_meta.items():
+                cm = copy(md)
+                seq_lens_j = [base_lens[i] + j for i in range(num_reqs)]
+                # Replicate the builder's FIA TND dummy-request padding
+                # (extra rows beyond num_reqs carry a sentinel length).
+                pad = len(md.seq_lens_list) - num_reqs
+                padded_lens = seq_lens_j + ([1] * pad if pad > 0 else [])
+                cm.seq_lens_list = padded_lens
+                sl_t = md.seq_lens.new_tensor(padded_lens)
+                cm.seq_lens = sl_t
+                cm.seq_lens_cpu = sl_t
+                if hasattr(cm, "_seq_lens_cpu"):
+                    cm._seq_lens_cpu = sl_t
+                if hasattr(cm, "max_seq_len"):
+                    cm.max_seq_len = max(seq_lens_j)
+                meta_j[key] = cm
+            steps.append(meta_j)
+        return steps
+    except Exception as exc:  # prebuild must never break the request
+        logger.warning(
+            "Multi-step prebuild metadata failed, falling back to per-step builds: %s", exc
+        )
+        return None
+
+
 def execute_multi_step_window(
     runner: Any, scheduler_output: SchedulerOutput, plan: dict[str, int]
 ) -> None:
@@ -387,19 +443,44 @@ def execute_multi_step_window(
                     )
                     update_cos_sin(positions)
 
-                    (attn_metadata, _spec_common) = runner._build_attention_metadata(
-                        num_tokens=num_reqs,
-                        num_reqs=num_reqs,
-                        max_query_len=1,
-                        num_tokens_padded=num_tokens_padded,
-                        num_reqs_padded=num_reqs_padded,
-                        ubatch_slices=None,
-                        logits_indices=logits_indices,
-                        use_spec_decode=False,
-                        num_scheduled_tokens={req_id: 1 for req_id in req_ids},
-                        num_scheduled_tokens_np=ones,
-                        cascade_attn_prefix_lens=None,
-                    )
+                    if step == 0:
+                        (attn_metadata, _spec_common) = runner._build_attention_metadata(
+                            num_tokens=num_reqs,
+                            num_reqs=num_reqs,
+                            max_query_len=1,
+                            num_tokens_padded=num_tokens_padded,
+                            num_reqs_padded=num_reqs_padded,
+                            ubatch_slices=None,
+                            logits_indices=logits_indices,
+                            use_spec_decode=False,
+                            num_scheduled_tokens={req_id: 1 for req_id in req_ids},
+                            num_scheduled_tokens_np=ones,
+                            cascade_attn_prefix_lens=None,
+                        )
+                        # Prebuild the attention metadata for steps 1..K-1
+                        # from the step-0 build: pure decode windows only vary
+                        # in seq lengths per step, and the FIA backend reads
+                        # seq_lens / seq_lens_list per layer.  A failure here
+                        # just keeps the per-step builder below.
+                        prebuilt_steps = _build_window_meta_copies(
+                            attn_metadata, runner, num_reqs, window_k
+                        )
+                    elif prebuilt_steps is not None:
+                        attn_metadata = prebuilt_steps[step - 1]
+                    else:
+                        (attn_metadata, _spec_common) = runner._build_attention_metadata(
+                            num_tokens=num_reqs,
+                            num_reqs=num_reqs,
+                            max_query_len=1,
+                            num_tokens_padded=num_tokens_padded,
+                            num_reqs_padded=num_reqs_padded,
+                            ubatch_slices=None,
+                            logits_indices=logits_indices,
+                            use_spec_decode=False,
+                            num_scheduled_tokens={req_id: 1 for req_id in req_ids},
+                            num_scheduled_tokens_np=ones,
+                            cascade_attn_prefix_lens=None,
+                        )
 
                     # Per-request decode embeddings: the talker derives its
                     # input from the previous step's sampled codec token
