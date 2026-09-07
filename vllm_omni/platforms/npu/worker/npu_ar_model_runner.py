@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import Mapping
 from copy import copy, deepcopy
@@ -150,6 +151,21 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         # Completed multi-step window output awaiting sample_tokens(); see
         # multi_step_decode.execute_multi_step_window.
         self._multi_step_pending_output: OmniModelRunnerOutput | None = None
+        # Stage-1 per-step timing (env-gated diagnostic; OMNI_MSD_STEP_TIMING=1).
+        # ``off_*`` accumulates single-step decode calls (one token/request per
+        # step), ``win_*`` accumulates window calls (window_k tokens/request per
+        # call) so the two paths are compared on equal footing.
+        if os.environ.get("OMNI_MSD_STEP_TIMING"):
+            self._msd_timing: dict[str, float | int] = {
+                "off_total": 0.0,
+                "off_steps": 0,
+                "win_total": 0.0,
+                "win_tokens": 0,
+            }
+            self._msd_t0: float | None = None
+        else:
+            self._msd_timing = None
+            self._msd_t0 = None
 
     def load_model(self, *args, **kwargs) -> None:
         super().load_model(*args, **kwargs)
@@ -391,6 +407,8 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             self._execution_start_time = time.perf_counter()
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
+        if self._msd_timing is not None and scheduler_output.total_num_scheduled_tokens > 0:
+            self._msd_t0 = time.perf_counter()
 
         #  -------------------------------------- Omni-new -------------------------------------------------
         # [Omni] Handle KV transfer BEFORE updating states (which removes finished requests)
@@ -475,7 +493,16 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         # the accounting shortfall.
         multi_step_plan = validate_multi_step_plan(self, scheduler_output)
         if multi_step_plan is not None:
+            if self._msd_timing is not None:
+                self._msd_win_t0 = time.perf_counter()
             execute_multi_step_window(self, scheduler_output, multi_step_plan)
+            if self._msd_timing is not None:
+                self._msd_timing["win_total"] += time.perf_counter() - self._msd_win_t0
+                self._msd_timing["win_tokens"] += int(
+                    multi_step_plan[next(iter(multi_step_plan))]
+                )
+                self._msd_t0 = None
+                self._msd_log()
             return None
         # Runner declined the planned window: shrink the K-token schedule
         # back to one token per request so the single-step fallback below
@@ -892,7 +919,25 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         if self.vllm_config.model_config.enable_return_routed_experts and hasattr(self, "_positions_cpu"):
             self._omni_routed_experts_d2h(scheduler_output)
 
+        if self._msd_timing is not None and self._msd_t0 is not None:
+            self._msd_timing["off_total"] += time.perf_counter() - self._msd_t0
+            self._msd_timing["off_steps"] += 1
+            self._msd_t0 = None
+            self._msd_log()
+
         return None
+
+    def _msd_log(self) -> None:
+        _msd = self._msd_timing
+        if _msd is None:
+            return
+        if int(_msd["off_steps"]) % 100 == 0 or int(_msd["win_tokens"]) % 1200 < 12:
+            off_ms = 1e3 * _msd["off_total"] / max(int(_msd["off_steps"]), 1)
+            win_ms = 1e3 * _msd["win_total"] / max(int(_msd["win_tokens"]), 1)
+            logger.info(
+                "MSD per-step=%.3fms (n=%d) MSD per-token=%.3fms (n=%d)",
+                off_ms, int(_msd["off_steps"]), win_ms, int(_msd["win_tokens"]),
+            )
 
     def _sample(
         self,

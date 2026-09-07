@@ -167,8 +167,12 @@ def scheduler_allows_multi_step(scheduler: Any) -> bool:
     model_config = vllm_config.model_config
     if not model_supports_multi_step(model_config):
         return False
-    if not getattr(scheduler.scheduler_config, "async_scheduling", False):
-        return False
+    # The window executor works under both async scheduling (the original
+    # target) and the sync OmniARScheduler (whose K-token plan is produced by
+    # the same plan_multi_step_window hook).  Sync windows consume the
+    # scheduler-provided input ids for step 0 (no async feedback), which the
+    # runner handles via the prev_sampled_token_ids fallback; the runner-side
+    # async feedback tail is gated on use_async_scheduling.
     parallel_config = vllm_config.parallel_config
     if (
         parallel_config.pipeline_parallel_size != 1
@@ -335,10 +339,22 @@ def plan_multi_step_window(scheduler: Any, scheduler_output: Any, steps: int) ->
 
     # Commit the window: K scheduled tokens per request and K in-flight
     # output placeholders so the engine-side accounting closes exactly when
-    # the runner reports the K sampled tokens.
+    # the runner reports the K sampled tokens.  Async scheduling needs the
+    # placeholder fence: the scheduler plans follow-up windows on top of the
+    # in-flight one, and the fence keeps the request out of those until its
+    # K tokens are reconciled.  The sync OmniARScheduler executes strictly
+    # one step at a time (schedule -> execute -> update), so only one window
+    # is ever in flight and no fence is needed; the K-1 optimistic computed
+    # tokens are rolled back by reconcile_window_shortfall when the window
+    # exits early.  num_in_flight_tokens is kept symmetric with
+    # num_computed_tokens in both modes (the base scheduler adds 1 for the
+    # pre-rewrite decode token, the runner's update_from_output subtracts K).
+    async_mode = bool(getattr(scheduler.scheduler_config, "async_scheduling", True))
     for req_id, request in windowed:
-        request.num_output_placeholders += extra
+        if async_mode:
+            request.num_output_placeholders += extra
         request.num_computed_tokens += extra
+        request.num_in_flight_tokens += extra
         scheduler_output.num_scheduled_tokens[req_id] = window_k
         scheduler_output.multi_step_plan[req_id] = window_k
     scheduler_output.total_num_scheduled_tokens += extra * len(windowed)
@@ -359,14 +375,19 @@ def reconcile_window_shortfall(
     confirmed length in both the window and fallback cases.  The remaining
     K - reported reservations (placeholders + optimistic computed tokens)
     belong to steps that never ran and are rolled back here.
+
+    Under sync scheduling no placeholder fence exists (one window in flight
+    max), so the whole shortfall lives in the optimistic ``num_computed_tokens``
+    the plan added and is rolled back directly.
     """
     shortfall = planned_steps - reported_tokens
     if shortfall <= 0:
         return
-    # Placeholders hold exactly K - reported in steady state; clamp only to
-    # stay defensive against unexpected interim adjustments, and roll back
-    # computed_tokens by the same amount so the (computed - placeholders)
-    # confirmed-length invariant is preserved.
-    shortfall = min(shortfall, max(request.num_output_placeholders, 0))
-    request.num_output_placeholders -= shortfall
+    # Async: placeholders hold exactly K - reported in steady state; clamp
+    # only to stay defensive against unexpected interim adjustments.
+    if request.num_output_placeholders > 0:
+        shortfall = min(shortfall, request.num_output_placeholders)
+        request.num_output_placeholders -= shortfall
+    # Sync: no placeholders were added; the plan inflated num_computed_tokens
+    # by extra (== planned_steps - 1), so the unproduced steps roll back here.
     request.num_computed_tokens -= shortfall

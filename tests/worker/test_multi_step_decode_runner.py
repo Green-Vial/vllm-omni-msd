@@ -135,9 +135,12 @@ def test_validate_refuses_mismatched_schedule():
     assert validate_multi_step_plan(runner, output) is None
 
 
-def test_validate_refuses_sync_scheduling():
+def test_validate_accepts_sync_scheduling():
+    # The window executor supports the sync scheduler (one window in flight,
+    # step-0 input from the request-local output chain); no sync refusal.
     runner = make_runner(["r0"], use_async_scheduling=False)
-    assert validate_multi_step_plan(runner, make_scheduler_output(["r0"])) is None
+    output = make_scheduler_output(["r0"])
+    assert validate_multi_step_plan(runner, output) == {"r0": 8}
 
 
 def test_validate_refuses_spec_decode():

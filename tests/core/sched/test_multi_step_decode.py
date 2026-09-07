@@ -74,6 +74,7 @@ def make_request(req_id="r0", *, computed=None, prompt=100, output_len=5, max_to
         num_prompt_tokens=prompt,
         num_tokens=prompt + output_len,
         num_output_placeholders=1,
+        num_in_flight_tokens=1,
         output_token_ids=[0] * output_len,
         has_encoder_inputs=False,
         use_structured_output=False,
@@ -120,6 +121,9 @@ def make_scheduler(requests, *, max_model_len=4096, fail_ids=()):
         requests={r.request_id: r for r in requests},
         kv_cache_manager=make_kv_manager(fail_ids=fail_ids),
         max_model_len=max_model_len,
+        # async and sync scheduling both host windows; the planner reads the
+        # mode only to choose the accounting path (placeholder fence vs direct).
+        scheduler_config=SimpleNamespace(async_scheduling=True),
     )
 
 
@@ -242,7 +246,6 @@ def test_scheduler_allows_multi_step_refusals():
         {"num_spec_tokens": 2},
         {"kv_transfer_criteria": {"type": "prefill_finished"}},
         {"lora_config": object()},
-        {"scheduler_config": SimpleNamespace(async_scheduling=False)},
         {"vllm_config": make_vllm_config(make_model_config(is_encoder_decoder=True))},
         {
             "vllm_config": make_vllm_config(

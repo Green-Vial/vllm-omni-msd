@@ -46,6 +46,7 @@ optimization.
 
 from __future__ import annotations
 
+import os
 from copy import copy
 from typing import Any
 
@@ -57,6 +58,7 @@ from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.utils import record_function_or_nullcontext
 from vllm_ascend.ascend_forward_context import set_ascend_forward_context
+import vllm_ascend.ops.rotary_embedding as vllm_ascend_rotary
 from vllm_ascend.ops.rotary_embedding import update_cos_sin
 
 from vllm_omni.data_entry_keys import flatten_payload
@@ -73,6 +75,14 @@ logger = init_logger(__name__)
 _refusal_counts: dict[str, int] = {}
 _executed_windows = 0
 _executed_steps = 0
+
+# WIA (window-internal amortization): second-order host-cost amortization
+# inside the K-step window, env-gated for A/B:
+#   OMNI_MSD_COS_PREBUILD=0  -> per-step update_cos_sin (default: prebuild)
+#   OMNI_MSD_TOK_FROM_STATE=0 -> device binary-token sampling (default: derive)
+# Both are pure optimizations with fallbacks; a failure never changes output.
+_COS_PREBUILD = os.environ.get("OMNI_MSD_COS_PREBUILD", "1") != "0"
+_TOK_FROM_STATE = os.environ.get("OMNI_MSD_TOK_FROM_STATE", "1") != "0"
 
 
 def _refuse(reason: str) -> None:
@@ -112,9 +122,10 @@ def validate_multi_step_plan(
         ):
             return _refuse("new_or_spec_or_encoder_reqs")
         # The window drives input feedback through the async-scheduling
-        # fast path; anything else falls back to the standard loop.
-        if not runner.use_async_scheduling:
-            return _refuse("no_async_scheduling")
+        # fast path; under sync scheduling the runner consumes the
+        # scheduler-provided input ids for step 0 instead (the
+        # prev_sampled_token_ids fallback below) and the async feedback
+        # tail is gated on use_async_scheduling.  Both modes are valid.
         if runner.num_spec_tokens or runner.speculative_config is not None:
             return _refuse("spec_decode")
         pp_group = get_pp_group()
@@ -294,6 +305,104 @@ def _build_window_meta_copies(
         return None
 
 
+def _prebuild_window_cos_sin(
+    runner: Any, comp_cpu: Any, num_reqs: int, window_k: int
+) -> bool:
+    """Fill the rotary cos/sin rows for all K window steps in one call.
+
+    The per-step positions are ``comp_cpu[i] + j`` (request i, step j), so the
+    whole window's rotary rows are a single ``update_cos_sin`` over
+    ``K * num_reqs`` positions instead of K per-step calls (each an
+    index_select + repeat + chunk over the cos/sin cache).  The captured decode
+    graph reads rows ``0..num_reqs-1``; per step the loop copies the prebuilt
+    block ``j*num_reqs..(j+1)*num_reqs`` into those rows (a plain device
+    copy).  Returns False on any failure -- the caller keeps calling
+    ``update_cos_sin`` per step, so this is a pure optimization (never a
+    correctness dependency).
+    """
+    try:
+        import vllm_ascend.ops.rotary_embedding as _rot
+
+        cos = getattr(_rot, "_cos", None)
+        cache = getattr(_rot, "_cos_sin_cache", None)
+        if cos is None or cache is None:
+            return False
+        if window_k * num_reqs > int(cos.shape[1]):
+            return False
+        all_pos = torch.tensor(
+            [int(comp_cpu[i]) + j for i in range(num_reqs) for j in range(window_k)],
+            dtype=torch.long,
+            device=runner.device,
+        )
+        _rot.update_cos_sin(all_pos)
+        return True
+    except Exception as exc:  # prebuild must never break the request
+        logger.warning(
+            "Multi-step cos prebuild failed, falling back to per-step updates: %s", exc
+        )
+        return False
+
+
+def _derive_engine_tokens(
+    runner: Any,
+    req_ids: list[str],
+    per_req_finished: list[bool],
+    sampling_metadata: Any,
+) -> tuple[torch.Tensor | None, bool]:
+    """Derive the per-step binary STOP/CONTINUE tokens from request-local state.
+
+    The talker maps ``state.finished`` to the stop rows ``[-inf, 0]`` (STOP) /
+    ``[0, -inf]`` (CONTINUE) inside ``make_omni_output``, so under greedy
+    sampling the sampled binary token is exactly ``int(finished)`` once the
+    ``min_tokens`` mask is released (the mask forces CONTINUE while
+    ``len(output_token_ids) < min_tokens``).  Deriving it on the host skips the
+    device sampler path (logit prep + sample kernel + token gather) with
+    identical values -- verified by the per-token dump compare.
+
+    Returns ``(tokens_gpu, ok)``; ``ok=False`` means the caller must run the
+    device sampler (any request is non-greedy, duplex, or logit-biased).
+    """
+    if not _TOK_FROM_STATE:
+        return None, False
+    try:
+        # The derivation relies on argmax sampling and on the request-local
+        # state chain matching the device stop rows exactly; refuse on any
+        # feature that could break the mapping (logit bias, non-greedy,
+        # native duplex).
+        if hasattr(runner.sampler, "logit_bias_state"):
+            bias_state = runner.sampler.logit_bias_state
+            if bias_state is not None and getattr(bias_state, "use_logit_bias", None) is not None:
+                if np.any(bias_state.use_logit_bias):
+                    return None, False
+        if not getattr(sampling_metadata, "all_greedy", False):
+            return None, False
+        tokens: list[int] = []
+        for i, req_id in enumerate(req_ids):
+            info = runner.model_intermediate_buffer.get(req_id, {})
+            if info.get("native_duplex"):
+                return None, False
+            req_state = runner.requests.get(req_id)
+            params = req_state.sampling_params if req_state is not None else None
+            min_tokens = int(getattr(params, "min_tokens", 0) or 0) if params is not None else 0
+            # The sampler's min_tokens mask counts the request's produced
+            # output tokens.  The runner's request-local output list is the
+            # authoritative count here (the window path appends one
+            # placeholder per step); sampling_metadata.output_token_ids may
+            # be None when no logits processor requires it.
+            out_len = len(req_state.output_token_ids) if req_state is not None else 0
+            masked = out_len < min_tokens
+            tokens.append(1 if (per_req_finished[i] and not masked) else 0)
+        # Shape (num_reqs, 1) to match the engine sampler's sampled_token_ids
+        # (the async feedback and window-end .tolist() both index [row][0]).
+        # dtype=torch.int32 matches the engine token layout (async feedback is
+        # scattered into the int32 input_ids buffer; int64 src is rejected by
+        # aclnnInplaceScatter on the reorder path).
+        return torch.tensor(tokens, dtype=torch.int32, device=runner.device).reshape(-1, 1), True
+    except Exception as exc:  # never guess a token on uncertainty
+        logger.warning("Multi-step engine-token derivation failed, using device sampler: %s", exc)
+        return None, False
+
+
 def execute_multi_step_window(
     runner: Any, scheduler_output: SchedulerOutput, plan: dict[str, int]
 ) -> None:
@@ -401,7 +510,19 @@ def execute_multi_step_window(
                         continue
                     input_ids[i] = prev_sampled[row, 0]
             else:
+                # Sync scheduling: no async feedback.  The sync sample path
+                # caches the real sampled tokens in the runner's request state
+                # (async caches -1 placeholders instead and consumes them via
+                # the feedback path above), so the previous token per request
+                # is the last output token.  The staged input_ids.cpu is stale
+                # here -- the window path never runs _prepare_inputs -- so
+                # copy it first (fills the padded rows) then overwrite the
+                # live rows with the true previous token.
                 runner.input_ids.copy_to_gpu(num_reqs)
+                for i, req_id in enumerate(req_ids):
+                    req_state = runner.requests.get(req_id)
+                    if req_state is not None and req_state.output_token_ids:
+                        input_ids[i] = req_state.output_token_ids[-1]
 
             kv_connector_output = None
             per_req_hidden: list[list[torch.Tensor]] = [[] for _ in range(num_reqs)]
@@ -410,6 +531,14 @@ def execute_multi_step_window(
             sampled_steps: list[torch.Tensor] = []
             comp_cpu = runner.input_batch.num_computed_tokens_cpu
             steps_done = 0
+
+            # WIA: prebuild the rotary cos/sin rows for the whole
+            # window once (K*num_reqs positions in a single update_cos_sin);
+            # per step the loop only copies the prebuilt block into the rows
+            # the captured graph reads.  A failure keeps per-step updates.
+            cos_prebuilt = _COS_PREBUILD and _prebuild_window_cos_sin(
+                runner, comp_cpu, num_reqs, window_k
+            )
 
             for step in range(window_k):
                 with record_function_or_nullcontext("multi_step_window:step"):
@@ -441,7 +570,21 @@ def execute_multi_step_window(
                         runner.query_start_loc.gpu[: num_reqs + 1],
                         runner.positions[:num_reqs],
                     )
-                    update_cos_sin(positions)
+                    if cos_prebuilt:
+                        # Per-step block copy: move the prebuilt rows for
+                        # step j into rows 0..num_reqs-1 (the rows the
+                        # captured graph reads).  Same device values as a
+                        # fresh update_cos_sin for these positions.
+                        j0 = step * num_reqs
+                        j1 = j0 + num_reqs
+                        vllm_ascend_rotary._cos[:, :num_reqs].copy_(
+                            vllm_ascend_rotary._cos[:, j0:j1]
+                        )
+                        vllm_ascend_rotary._sin[:, :num_reqs].copy_(
+                            vllm_ascend_rotary._sin[:, j0:j1]
+                        )
+                    else:
+                        update_cos_sin(positions)
 
                     if step == 0:
                         (attn_metadata, _spec_common) = runner._build_attention_metadata(
@@ -561,46 +704,59 @@ def execute_multi_step_window(
                         else:
                             per_req_finished[i] = per_req_finished[i] or bool(flag)
 
-                sample_hidden_states = hidden_states[logits_indices]
-                try:
-                    logits = runner.model.compute_logits(
-                        sample_hidden_states, sampling_metadata=sampling_metadata
-                    )
-                except TypeError:
-                    logits = runner.model.compute_logits(sample_hidden_states)
-                if step == 0:
-                    # Fill the previous engine step's pending placeholder
-                    # exactly like the normal _sample path would.
-                    runner.input_batch.update_async_output_token_ids()
-                # Mirror _sample's custom-sampler branch (npu_ar_model_runner
-                # _sample): logit bias -> duplex hook -> model sampler with
-                # prepared metadata, falling back to the engine sampler when
-                # the model sampler declines.  Keeping this identical to the
-                # single-step path is what allows prefer_model_sampler models
-                # (e.g. the MiniCPM-o talker) to host windows.
-                model_sample = getattr(runner.model, "sample", None)
-                if callable(model_sample) and getattr(runner.model, "prefer_model_sampler", False):
-                    if hasattr(runner.sampler, "logit_bias_state"):
-                        runner.sampler.logit_bias_state.apply_logit_bias(
-                            logits,
-                            runner.input_batch.expanded_idx_mapping,
-                            runner.input_batch.idx_mapping_np,
-                            runner.input_batch.positions[runner.input_batch.logits_indices],
+                # Engine binary STOP/CONTINUE token.  WIA derives it
+                # from the request-local state chain (identical values under
+                # greedy sampling, skipping the device sampler path); any
+                # uncertainty falls back to the exact single-step sampler
+                # machinery below.
+                derived_tokens, tok_ok = _derive_engine_tokens(
+                    runner, req_ids, per_req_finished, sampling_metadata
+                )
+                if tok_ok:
+                    sampled_steps.append(derived_tokens)
+                else:
+                    sample_hidden_states = hidden_states[logits_indices]
+                    try:
+                        logits = runner.model.compute_logits(
+                            sample_hidden_states, sampling_metadata=sampling_metadata
                         )
-                    prepared_sampling_metadata = runner._sampling_metadata_for_model_sampler(
-                        sampling_metadata
-                    )
-                    runner._apply_duplex_sampling(logits, prepared_sampling_metadata)
-                    sampler_output = model_sample(logits, prepared_sampling_metadata)
-                    if sampler_output is None:
+                    except TypeError:
+                        logits = runner.model.compute_logits(sample_hidden_states)
+                    if step == 0:
+                        # Fill the previous engine step's pending placeholder
+                        # exactly like the normal _sample path would (async
+                        # scheduling only; sync has no pending placeholder).
+                        if hasattr(runner.input_batch, "update_async_output_token_ids"):
+                            runner.input_batch.update_async_output_token_ids()
+                    # Mirror _sample's custom-sampler branch (npu_ar_model_runner
+                    # _sample): logit bias -> duplex hook -> model sampler with
+                    # prepared metadata, falling back to the engine sampler when
+                    # the model sampler declines.  Keeping this identical to the
+                    # single-step path is what allows prefer_model_sampler models
+                    # (e.g. the MiniCPM-o talker) to host windows.
+                    model_sample = getattr(runner.model, "sample", None)
+                    if callable(model_sample) and getattr(runner.model, "prefer_model_sampler", False):
+                        if hasattr(runner.sampler, "logit_bias_state"):
+                            runner.sampler.logit_bias_state.apply_logit_bias(
+                                logits,
+                                runner.input_batch.expanded_idx_mapping,
+                                runner.input_batch.idx_mapping_np,
+                                runner.input_batch.positions[runner.input_batch.logits_indices],
+                            )
+                        prepared_sampling_metadata = runner._sampling_metadata_for_model_sampler(
+                            sampling_metadata
+                        )
+                        runner._apply_duplex_sampling(logits, prepared_sampling_metadata)
+                        sampler_output = model_sample(logits, prepared_sampling_metadata)
+                        if sampler_output is None:
+                            sampler_output = runner.sampler(
+                                logits=logits, sampling_metadata=sampling_metadata
+                            )
+                    else:
                         sampler_output = runner.sampler(
                             logits=logits, sampling_metadata=sampling_metadata
                         )
-                else:
-                    sampler_output = runner.sampler(
-                        logits=logits, sampling_metadata=sampling_metadata
-                    )
-                sampled_steps.append(sampler_output.sampled_token_ids)
+                    sampled_steps.append(sampler_output.sampled_token_ids)
                 steps_done = step + 1
 
                 # Mirror _bookkeeping_sync's async bookkeeping: one -1
@@ -644,20 +800,23 @@ def execute_multi_step_window(
                         out_ids[idx] = int(sampled_lists[s][i])
 
             # Async feedback for the next engine step: the last window
-            # step's sampled token becomes the next input token.
-            runner.input_batch.prev_sampled_token_ids = sampled_steps[-1]
-            runner.input_batch.prev_req_id_to_index = {req_id: i for i, req_id in enumerate(req_ids)}
-            copy_stream = getattr(runner, "async_output_copy_stream", None)
-            if copy_stream is not None:
-                with torch.npu.stream(copy_stream):
-                    copy_stream.wait_stream(torch.npu.current_stream())
-                    last_sampled_cpu = sampled_steps[-1].to("cpu", non_blocking=True)
-                ready_event = torch.npu.Event(blocking=True)
-                ready_event.record(copy_stream)
-            else:
-                last_sampled_cpu = sampled_steps[-1].cpu()
-                ready_event = None
-            runner.input_batch.set_async_sampled_token_ids(last_sampled_cpu, ready_event)
+            # step's sampled token becomes the next input token.  Sync
+            # scheduling consumes the sampled tokens through the normal
+            # scheduler path instead, so this whole tail is async-only.
+            if getattr(runner, "use_async_scheduling", False):
+                runner.input_batch.prev_sampled_token_ids = sampled_steps[-1]
+                runner.input_batch.prev_req_id_to_index = {req_id: i for i, req_id in enumerate(req_ids)}
+                copy_stream = getattr(runner, "async_output_copy_stream", None)
+                if copy_stream is not None:
+                    with torch.npu.stream(copy_stream):
+                        copy_stream.wait_stream(torch.npu.current_stream())
+                        last_sampled_cpu = sampled_steps[-1].to("cpu", non_blocking=True)
+                    ready_event = torch.npu.Event(blocking=True)
+                    ready_event.record(copy_stream)
+                else:
+                    last_sampled_cpu = sampled_steps[-1].cpu()
+                    ready_event = None
+                runner.input_batch.set_async_sampled_token_ids(last_sampled_cpu, ready_event)
             runner.kv_connector_output = None
 
             runner._multi_step_pending_output = _build_window_output(
